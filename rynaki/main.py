@@ -1,5 +1,7 @@
 import cloudscraper
+import re
 from bs4 import BeautifulSoup
+from requests import RequestException
 
 
 DEFAULT_AKITUDE_URL = "https://en.akinator.com/assets/img/akitudes_670x1096/defi.png"
@@ -26,6 +28,7 @@ class Akinator():
         self.answer_id = None
         self.akitude = DEFAULT_AKITUDE_URL
         self.question_id = None
+        self._first_step = 0
 
         if theme == "characters":
             sid = 1
@@ -45,6 +48,29 @@ class Akinator():
             "answer": 0,
         }
 
+    def _post(self, endpoint, payload):
+        payload = dict(payload)
+        if isinstance(payload.get("cm"), bool):
+            payload["cm"] = "true" if payload["cm"] else "false"
+        try:
+            response = self.scraper.post(
+                f"{self.ENDPOINT}{endpoint}", data=payload, timeout=20
+            )
+            response.raise_for_status()
+            return response
+        except RequestException as exc:
+            raise AkinatorError("Akinator request failed.") from exc
+
+    def _post_json(self, endpoint, payload):
+        response = self._post(endpoint, payload)
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise AkinatorError("Invalid response received from Akinator API.") from exc
+        if not isinstance(result, dict):
+            raise AkinatorError("Invalid response received from Akinator API.")
+        return result
+
     def start_game(self):
         self.name = None
         self.description = None
@@ -53,23 +79,43 @@ class Akinator():
         self.question_id = None
         self.akitude = DEFAULT_AKITUDE_URL
 
-        game = self.scraper.post(f"{self.ENDPOINT}game", json={
+        game = self._post("game", {
             "sid": self.json["sid"],
             "cm": self.json["cm"]
         }).text
 
         soup = BeautifulSoup(game, "html.parser")
-        askSoundlike = soup.find(id="askSoundlike")
-        question_label = soup.find(id="question-label").get_text()
-        session_id = askSoundlike.find(id="session").get("value")
-        signature_id = askSoundlike.find(id="signature").get("value")
+        question_label = soup.find(id="question-label")
+        session = soup.select_one("#askSoundlike input[name='session'][value]")
+        if session is None:
+            session = soup.select_one("input[name='session'][value]")
+        if (question_label is None or not question_label.get_text(strip=True)
+                or session is None or not session.get("value")):
+            raise AkinatorError("Akinator did not return a valid game.")
 
-        self.json["session"] = session_id
-        self.json["signature"] = signature_id
-        self.step = 0
-        self.progression = 0.0
-        self.question = question_label
-        self.question_id = None
+        self.json = {
+            "sid": self.json["sid"], "cm": self.json["cm"],
+            "answer": 0, "session": session["value"],
+        }
+        # Signatures are absent on current pages but may exist on older ones.
+        signature = soup.select_one("input[name='signature'][value]")
+        if signature is not None and signature.get("value"):
+            self.json["signature"] = signature["value"]
+
+        # Current games start at step 1; older pages started at step 0.
+        for key in ("step", "progression"):
+            number = r"[0-9]+" if key == "step" else r"[0-9]+(?:\.[0-9]+)?"
+            match = re.search(
+                rf"localStorage\.setItem\(\s*['\"]{key}['\"]\s*,\s*"
+                rf"['\"]?({number})['\"]?\s*\)",
+                game,
+            )
+            value = match.group(1) if match else "0"
+            self.json[key] = int(value) if key == "step" else float(value)
+        self.step = self.json["step"]
+        self._first_step = self.step
+        self.progression = self.json["progression"]
+        self.question = question_label.get_text(" ", strip=True)
         return self.question
 
     def post_answer(self, answer: str):
@@ -81,15 +127,14 @@ class Akinator():
         self.json["answer"] = answers_map[answer]
 
         try:
-            response = self.scraper.post(
-                f"{self.ENDPOINT}answer", json=self.json).json()
+            response = self._post_json("answer", self.json)
 
             if response.get("completion") == "KO":
                 raise AkinatorError("Akinator session error (completion: KO). Please start a new game.")
             elif response.get("completion") == "SOUNDLIKE":
                 raise AkinatorError("A 'sound like' guess was found, which is not supported.")
 
-            if "question" in response:
+            if isinstance(response.get("question"), str) and response["question"].strip():
                 self.json["step"] = int(response["step"])
                 self.json["progression"] = float(response["progression"])
                 if "question_id" in response:
@@ -100,11 +145,11 @@ class Akinator():
                 self.question = response["question"]
                 if response.get("akitude"):
                     self.akitude = f"https://en.akinator.com/assets/img/akitudes_670x1096/{response['akitude']}"
-            elif "name_proposition" in response:
+            elif response.get("name_proposition"):
                 self.name = response["name_proposition"]
-                self.description = response["description_proposition"]
-                self.photo = response["photo"]
-                self.answer_id = response["id_proposition"]
+                self.description = response.get("description_proposition", "")
+                self.photo = response.get("photo")
+                self.answer_id = response.get("id_proposition")
                 self.json["step_last_proposition"] = int(self.json["step"])
             else:
                 raise AkinatorError("Invalid response received from Akinator API.")
@@ -116,15 +161,14 @@ class Akinator():
             raise AkinatorError(f"Akinator request failed: {e}")
 
     def go_back(self):
-        if self.json["step"] == 0:
+        if self.json["step"] <= self._first_step:
             raise AkinatorError("It's the first question, can't go back.")
 
         self.name, self.description, self.photo, self.answer_id = None, None, None, None
         self.json.pop("answer", None)
 
         try:
-            goback = self.scraper.post(
-                f"{self.ENDPOINT}cancel_answer", json=self.json).json()
+            goback = self._post_json("cancel_answer", self.json)
             self.json["step"] = int(goback["step"])
             self.json["progression"] = float(goback["progression"])
             if "question_id" in goback:
@@ -141,9 +185,7 @@ class Akinator():
 
     def exclude(self):
         try:
-            response = self.scraper.post(
-                f"{self.ENDPOINT}exclude", json=self.json
-            ).json()
+            response = self._post_json("exclude", self.json)
         except Exception as e:
             raise AkinatorError(f"Exclude request failed: {e}")
 
